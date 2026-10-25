@@ -1,5 +1,8 @@
 import { defineConfig } from 'tsup';
 
+// The three builds run in parallel, so none of them cleans dist/: one
+// cleaning could delete another's output. `npm run build` empties it first.
+//
 // No source maps on purpose: esbuild embeds the original sources in the map,
 // which would publish src/ to npm through the back door.
 const shared = { dts: true, splitting: false, treeshake: true, sourcemap: false } as const;
@@ -7,7 +10,6 @@ const shared = { dts: true, splitting: false, treeshake: true, sourcemap: false 
 export default defineConfig([
   {
     ...shared,
-    clean: true,
     entry: { index: 'src/node/index.ts', register: 'src/node/register.ts', next: 'src/next/server.ts' },
     format: ['esm', 'cjs'],
     platform: 'node',
