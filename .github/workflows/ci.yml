@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Release calls this workflow rather than repeating it, so a tag is verified
+  # by exactly the checks that guard main.
+  workflow_call:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      # The build and test tools need Node 22+.
+      matrix:
+        node-version: ['22', '24']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - run: npm ci
+      - run: npm run check:version
+      - run: npm run typecheck
+      - run: npm run build
+      # Loopback only: the suite never leaves the machine.
+      - run: npm test
+      - run: npm run check:tarball
+      - uses: actions/upload-artifact@v4
+        if: matrix.node-version == '22'
+        with:
+          name: dist
+          path: dist
+
+  # The package promises Node 18.18+ (for --import). Run the built package there.
+  smoke:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ['18', '20']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - run: node scripts/smoke.mjs

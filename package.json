@@ -1,0 +1,125 @@
+{
+  "name": "@naijacloud/argus",
+  "version": "0.1.0",
+  "description": "Official JavaScript SDK for Naijacloud Argus: errors, logs, metrics, traces, cron check-ins and feature flags.",
+  "license": "MIT",
+  "author": "Naija Cloud",
+  "homepage": "https://www.naijacloud.com/argus",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/naijacloud/argus-js.git"
+  },
+  "bugs": {
+    "url": "https://github.com/naijacloud/argus-js/issues"
+  },
+  "keywords": [
+    "naijacloud",
+    "argus",
+    "error-tracking",
+    "monitoring",
+    "logging",
+    "tracing",
+    "opentelemetry",
+    "nextjs",
+    "sdk"
+  ],
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "browser": {
+    "./dist/index.js": "./dist/browser.js",
+    "./dist/index.cjs": "./dist/browser.cjs"
+  },
+  "bin": {
+    "argus": "./dist/bin.js"
+  },
+  "exports": {
+    ".": {
+      "browser": {
+        "types": "./dist/browser.d.ts",
+        "import": "./dist/browser.js",
+        "require": "./dist/browser.cjs"
+      },
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./register": {
+      "import": "./dist/register.js",
+      "require": "./dist/register.cjs"
+    },
+    "./browser": {
+      "import": {
+        "types": "./dist/browser.d.ts",
+        "default": "./dist/browser.js"
+      },
+      "require": {
+        "types": "./dist/browser.d.cts",
+        "default": "./dist/browser.cjs"
+      }
+    },
+    "./next": {
+      "browser": {
+        "types": "./dist/next.client.d.ts",
+        "import": "./dist/next.client.js",
+        "require": "./dist/next.client.cjs"
+      },
+      "edge-light": {
+        "types": "./dist/next.client.d.ts",
+        "import": "./dist/next.client.js",
+        "require": "./dist/next.client.cjs"
+      },
+      "import": {
+        "types": "./dist/next.d.ts",
+        "default": "./dist/next.js"
+      },
+      "require": {
+        "types": "./dist/next.d.cts",
+        "default": "./dist/next.cjs"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "SECURITY.md"
+  ],
+  "engines": {
+    "node": ">=18.18.0"
+  },
+  "sideEffects": [
+    "./dist/register.js",
+    "./dist/register.cjs",
+    "./dist/bin.js"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:contract": "node test/contract/run.mjs",
+    "check:version": "node scripts/check-version.mjs",
+    "check:tarball": "node scripts/check-tarball.mjs",
+    "prepublishOnly": "npm run check:version && npm run build && npm test",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "happy-dom": "^21.0.4",
+    "tsup": "^9.0.0",
+    "typescript": "^5.9.3",
+    "vitest": "^5.0.5"
+  }
+}
