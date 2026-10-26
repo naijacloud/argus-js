@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { Client, type Platform, Span } from '../src/core/client.js';
+import { Client, MAX_OTLP_BODY, type Platform, Span } from '../src/core/client.js';
 import { FakeArgus } from './support/argus.js';
 
 let argus: FakeArgus;
@@ -222,5 +222,197 @@ describe('crons and flags', () => {
 
     argus.status['/v1/flags/evaluate'] = 500;
     expect(await c.isOn('new-checkout', 'user-2', false)).toBe(false);
+  });
+});
+
+describe('OTLP batch splitting', () => {
+  const bytes = (s: string) => new TextEncoder().encode(s).length;
+
+  it('splits logs so each request body is at most 512 KB', async () => {
+    const c = client();
+    // 150 logs of ~6 KB: 3,000 characters but 6,000 bytes, so bytes are what count.
+    for (let i = 0; i < 150; i++) c.log('info', `line ${i} ${'é'.repeat(3000)}`);
+    await c.flush(5000);
+    const reqs = argus.on('/v1/logs');
+    expect(reqs.length).toBeGreaterThan(1);
+    for (const r of reqs) expect(bytes(r.body)).toBeLessThanOrEqual(MAX_OTLP_BODY);
+    const records = reqs.flatMap((r) => JSON.parse(r.body).resourceLogs[0].scopeLogs[0].logRecords);
+    expect(records).toHaveLength(150);
+    expect(records.map((l: any) => l.body.stringValue.split(' ')[1])).toEqual([...Array(150).keys()].map(String));
+  });
+
+  it('splits traces and metrics too, and leaves small batches whole', async () => {
+    const c = client();
+    for (let i = 0; i < 200; i++) c.trace(`op ${i}`, () => undefined, { note: 'x'.repeat(4000) });
+    for (let i = 0; i < 200; i++) c.count('jobs', 1, { job: `${i}-${'y'.repeat(4000)}` });
+    c.log('info', 'one small line');
+    await c.flush(5000);
+    for (const path of ['/v1/traces', '/v1/metrics']) {
+      const reqs = argus.on(path);
+      expect(reqs.length, path).toBeGreaterThan(1);
+      for (const r of reqs) expect(bytes(r.body), path).toBeLessThanOrEqual(MAX_OTLP_BODY);
+    }
+    const spans = argus.on('/v1/traces').flatMap((r) => JSON.parse(r.body).resourceSpans[0].scopeSpans[0].spans);
+    expect(spans).toHaveLength(200);
+    const metrics = argus.on('/v1/metrics').flatMap((r) => JSON.parse(r.body).resourceMetrics[0].scopeMetrics[0].metrics);
+    expect(metrics).toHaveLength(200);
+    expect(argus.on('/v1/logs')).toHaveLength(1);
+  });
+});
+
+describe('User-Agent', () => {
+  it('sends the platform user agent on every endpoint', async () => {
+    const c = client({}, { userAgent: 'argus.javascript/9.9.9' });
+    c.captureMessage('hello');
+    c.log('info', 'x');
+    c.count('n');
+    c.trace('t', () => undefined);
+    c.checkIn('job', 'ok');
+    await c.isOn('f', 'user-1');
+    await c.flush();
+    const paths = new Set(argus.received.map((r) => r.path.split('/').slice(0, 3).join('/')));
+    expect(paths.size).toBeGreaterThanOrEqual(6);
+    for (const r of argus.received) expect(r.headers['user-agent'], r.path).toBe('argus.javascript/9.9.9');
+  });
+
+  it('sets none when the platform has none (browsers)', async () => {
+    const c = client({}, { keyInUrl: true });
+    c.captureMessage('hello');
+    await c.flush();
+    expect(argus.on('/api/42/envelope/')[0]?.headers['user-agent']).not.toMatch(/^argus/);
+  });
+});
+
+describe('flags transport', () => {
+  it('caches for 30 s per subject', async () => {
+    argus.flags = { a: 'on' };
+    const c = client();
+    const realNow = Date.now;
+    let now = realNow();
+    Date.now = () => now;
+    try {
+      expect(await c.isOn('a', 'u1')).toBe(true);
+      now += 29_000;
+      expect(await c.isOn('a', 'u1')).toBe(true);
+      expect(argus.on('/v1/flags/evaluate')).toHaveLength(1);
+      now += 2_000;
+      await c.isOn('a', 'u1');
+      expect(argus.on('/v1/flags/evaluate')).toHaveLength(2);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  it('gives up after 2 s and returns the caller default', async () => {
+    let calls = 0;
+    const hang = (async () => {
+      calls++;
+      return new Promise<Response>(() => undefined); // never answers, ignores the signal
+    }) as unknown as typeof fetch;
+    const c = client({ fetch: hang });
+    const t0 = Date.now();
+    expect(await c.variant('theme', 'u1', 'light')).toBe('light');
+    expect(await c.isOn('new-checkout', 'u2', true)).toBe(true);
+    const took = Date.now() - t0;
+    expect(calls).toBe(2);
+    expect(took).toBeGreaterThanOrEqual(3900);
+    expect(took).toBeLessThan(6000);
+  }, 10_000);
+
+  it('aborts the request on timeout', async () => {
+    let aborted = false;
+    const f = (async (_u: string, init: RequestInit) =>
+      new Promise<Response>((_r, reject) => {
+        init.signal?.addEventListener('abort', () => {
+          aborted = true;
+          reject(new Error('aborted'));
+        });
+      })) as unknown as typeof fetch;
+    const c = client({ fetch: f });
+    expect(await c.isOn('x', 'u1', false)).toBe(false);
+    expect(aborted).toBe(true);
+  }, 10_000);
+
+  it('stops asking after 401 or 403, returning the default', async () => {
+    for (const code of [401, 403]) {
+      argus.received = [];
+      argus.status['/v1/flags/evaluate'] = code;
+      argus.flags = { a: 'on' };
+      const c = client();
+      expect(await c.isOn('a', 'u1', false)).toBe(false);
+      delete argus.status['/v1/flags/evaluate'];
+      expect(await c.isOn('a', 'u2', false)).toBe(false);
+      expect(argus.on('/v1/flags/evaluate')).toHaveLength(1);
+      // Other endpoints are unaffected.
+      c.log('info', 'still here');
+      await c.flush();
+      expect(argus.on('/v1/logs')).toHaveLength(1);
+    }
+  });
+
+  it('honours 429 Retry-After, then asks again', async () => {
+    argus.status['/v1/flags/evaluate'] = 429;
+    argus.headers['/v1/flags/evaluate'] = { 'Retry-After': '30' };
+    argus.flags = { a: 'on' };
+    const c = client();
+    const realNow = Date.now;
+    let now = realNow();
+    Date.now = () => now;
+    try {
+      expect(await c.isOn('a', 'u1', false)).toBe(false);
+      delete argus.status['/v1/flags/evaluate'];
+      now += 10_000;
+      expect(await c.isOn('a', 'u1', false)).toBe(false);
+      expect(argus.on('/v1/flags/evaluate')).toHaveLength(1);
+      now += 21_000;
+      expect(await c.isOn('a', 'u1', false)).toBe(true);
+      expect(argus.on('/v1/flags/evaluate')).toHaveLength(2);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  it('serves the last answer when a refresh fails', async () => {
+    argus.flags = { a: 'on' };
+    const c = client();
+    const realNow = Date.now;
+    let now = realNow();
+    Date.now = () => now;
+    try {
+      expect(await c.isOn('a', 'u1', false)).toBe(true);
+      argus.status['/v1/flags/evaluate'] = 503;
+      now += 31_000;
+      expect(await c.isOn('a', 'u1', false)).toBe(true);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  it('returns the default for a network error or a body that is not JSON', async () => {
+    const down = (async () => {
+      throw new TypeError('fetch failed');
+    }) as unknown as typeof fetch;
+    expect(await client({ fetch: down }).variant('t', 'u1', 'light')).toBe('light');
+    const junk = (async () => new Response('<html>', { status: 200 })) as unknown as typeof fetch;
+    expect(await client({ fetch: junk }).variant('t', 'u1', 'light')).toBe('light');
+  });
+});
+
+describe('cron 404', () => {
+  it('drops that check-in only and keeps the endpoint open', async () => {
+    argus.status['/v1/cron/missing'] = 404;
+    const c = client();
+    c.checkIn('missing', 'ok');
+    await c.flush();
+    c.checkIn('nightly', 'start');
+    c.checkIn('missing', 'ok');
+    c.checkIn('nightly', 'ok');
+    await c.flush();
+    expect(argus.on('/v1/cron/').map((r) => r.path)).toEqual([
+      '/v1/cron/missing',
+      '/v1/cron/nightly/start',
+      '/v1/cron/missing',
+      '/v1/cron/nightly',
+    ]);
   });
 });

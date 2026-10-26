@@ -11,7 +11,7 @@ import {
 } from './otlp.js';
 import { scrub, scrubString } from './scrub.js';
 import { type Frame, parseStack } from './stack.js';
-import { type Request, Transport } from './transport.js';
+import { type Request, Transport, retryAfterMs } from './transport.js';
 import { CONTRACT, VERSION } from '../version.js';
 
 export type Level = 'fatal' | 'error' | 'warning' | 'info' | 'debug';
@@ -103,6 +103,8 @@ export interface Platform {
   withSpan<T>(span: Span, fn: () => T): T;
   onOffline?: (lane: string, req: Request) => boolean;
   fetch: typeof fetch;
+  /** Sent as User-Agent on every request (servers; browsers can't set it). */
+  userAgent?: string;
 }
 
 const FLUSH_LOGS_MS = 5000;
@@ -112,6 +114,13 @@ const MAX_LOGS = 1000;
 const MAX_SPANS = 512;
 const HIST_BOUNDS = [5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10_000];
 const CAPTURED = Symbol.for('argus.captured');
+/** An OTLP body larger than this is split, so a batch always fits the 1 MB queue. */
+export const MAX_OTLP_BODY = 512 * 1024;
+const FLAGS_TIMEOUT_MS = 2000;
+const FLAGS_CACHE_MS = 30_000;
+
+const utf8 = new TextEncoder();
+const byteLength = (s: string): number => utf8.encode(s).length;
 
 /** A unit of work in a trace. End it once. */
 export class Span {
@@ -202,6 +211,10 @@ export class Client {
   private metricStart = Date.now();
   private timers: ReturnType<typeof setInterval>[] = [];
   private flagCache = new Map<string, { at: number; flags: Record<string, string> }>();
+  /** 401/403 from the flags endpoint: stop asking until restart. */
+  private flagsDead = false;
+  /** 429 from the flags endpoint: ask again after this time. */
+  private flagsBlockedUntil = 0;
   private closed = false;
 
   constructor(options: Options, readonly platform: Platform) {
@@ -334,6 +347,7 @@ export class Client {
         : {
             'Content-Type': 'application/x-sentry-envelope',
             'X-Sentry-Auth': `Sentry sentry_version=7, sentry_client=${sdk.name}/${VERSION}, sentry_key=${d.publicKey}`,
+            ...this.uaHeader(),
           },
       persist: true,
     });
@@ -461,28 +475,60 @@ export class Client {
 
   // ---- flags ----
 
-  /** Every flag's variant for a subject (a user id), cached for 30 s. */
+  /**
+   * Every flag's variant for a subject (a user id), cached for 30 s. {} (so
+   * the caller's fallback) when Argus can't answer within 2 s, refused the key
+   * (401/403: not asked again until restart) or is rate limiting (429: not
+   * asked again until Retry-After passes).
+   */
   async evaluateFlags(subject: string, attributes?: Record<string, string>): Promise<Record<string, string>> {
     if (!this.enabled || !subject) return {};
     const cacheKey = `${subject}|${JSON.stringify(attributes ?? {})}`;
     const hit = this.flagCache.get(cacheKey);
-    if (hit && Date.now() - hit.at < 30_000) return hit.flags;
+    if (hit && Date.now() - hit.at < FLAGS_CACHE_MS) return hit.flags;
+    const stale = hit?.flags ?? {};
+    if (this.flagsDead || Date.now() < this.flagsBlockedUntil) return stale;
     const d = this.dsn as Dsn;
+    const ac = typeof AbortController === 'function' ? new AbortController() : undefined;
+    const timer = setTimeout(() => ac?.abort(), FLAGS_TIMEOUT_MS) as unknown as { unref?: () => void };
+    timer.unref?.();
     try {
-      const res = await (this.options.fetch ?? this.platform.fetch)(ingestUrl(d, '/v1/flags/evaluate', this.platform.keyInUrl), {
+      const request = (this.options.fetch ?? this.platform.fetch)(ingestUrl(d, '/v1/flags/evaluate', this.platform.keyInUrl), {
         method: 'POST',
         headers: this.platform.keyInUrl
           ? { 'Content-Type': 'text/plain;charset=UTF-8' }
-          : { 'Content-Type': 'application/json', Authorization: `Bearer ${d.publicKey}` },
+          : { 'Content-Type': 'application/json', Authorization: `Bearer ${d.publicKey}`, ...this.uaHeader() },
         body: JSON.stringify({ subject, environment: this.options.environment, attributes: attributes ?? {} }),
+        signal: ac?.signal,
       });
-      if (!res.ok) return hit?.flags ?? {};
-      const out = ((await res.json()) as { flags?: Record<string, string> }).flags ?? {};
+      // The timeout holds even for a fetch that ignores the signal.
+      const res = await Promise.race([
+        request,
+        new Promise<never>((_r, reject) => {
+          ac?.signal.addEventListener('abort', () => reject(new Error('flags: timed out')));
+        }),
+      ]);
+      if (res.status === 401 || res.status === 403) {
+        this.flagsDead = true;
+        if (this.options.debug) console.warn(`[argus] flags: ${res.status}, the key was refused; stopping until restart`);
+        return stale;
+      }
+      if (res.status === 429) {
+        this.flagsBlockedUntil = Date.now() + retryAfterMs(res.headers);
+        return stale;
+      }
+      if (!res.ok) return stale;
+      const raw = ((await res.json()) as { flags?: unknown }).flags;
+      const out: Record<string, string> = {};
+      if (raw && typeof raw === 'object') for (const [k, v] of Object.entries(raw)) out[k] = String(v);
       if (this.flagCache.size > 1000) this.flagCache.clear();
       this.flagCache.set(cacheKey, { at: Date.now(), flags: out });
       return out;
-    } catch {
-      return hit?.flags ?? {};
+    } catch (err) {
+      if (this.options.debug) console.warn(`[argus] flags: ${String(err)}`);
+      return stale;
+    } finally {
+      clearTimeout(timer as unknown as ReturnType<typeof setTimeout>);
     }
   }
 
@@ -511,23 +557,41 @@ export class Client {
     };
   }
 
+  private uaHeader(): Record<string, string> {
+    return this.platform.userAgent ? { 'User-Agent': this.platform.userAgent } : {};
+  }
+
   private otel(lane: string, path: string, body: string, contentType = 'application/json'): void {
     const d = this.dsn as Dsn;
     this.transport.send(lane, {
       url: ingestUrl(d, path, this.platform.keyInUrl),
       body,
-      headers: this.platform.keyInUrl ? { 'Content-Type': contentType } : { 'Content-Type': contentType, Authorization: `Bearer ${d.publicKey}` },
+      headers: this.platform.keyInUrl
+        ? { 'Content-Type': contentType }
+        : { 'Content-Type': contentType, Authorization: `Bearer ${d.publicKey}`, ...this.uaHeader() },
     });
+  }
+
+  /** Builds an OTLP body, halving the batch until each body is at most 512 KB. */
+  private otlp<T>(lane: string, path: string, build: (resource: Attrs, items: T[]) => string, items: T[]): void {
+    const body = build(this.resource(), items);
+    if (items.length > 1 && byteLength(body) > MAX_OTLP_BODY) {
+      const half = Math.ceil(items.length / 2);
+      this.otlp(lane, path, build, items.slice(0, half));
+      this.otlp(lane, path, build, items.slice(half));
+      return;
+    }
+    this.otel(lane, path, body);
   }
 
   flushLogs(): void {
     if (!this.logBuf.length || !this.dsn) return;
-    this.otel('logs', '/v1/logs', logsRequest(this.resource(), this.logBuf.splice(0, MAX_LOGS)));
+    this.otlp('logs', '/v1/logs', logsRequest, this.logBuf.splice(0, MAX_LOGS));
   }
 
   flushSpans(): void {
     if (!this.spanBuf.length || !this.dsn) return;
-    this.otel('traces', '/v1/traces', tracesRequest(this.resource(), this.spanBuf.splice(0, MAX_SPANS)));
+    this.otlp('traces', '/v1/traces', tracesRequest, this.spanBuf.splice(0, MAX_SPANS));
   }
 
   flushMetrics(): void {
@@ -555,7 +619,7 @@ export class Client {
     }
     this.metricAgg.clear();
     this.metricStart = end;
-    this.otel('metrics', '/v1/metrics', metricsRequest(this.resource(), points));
+    this.otlp('metrics', '/v1/metrics', metricsRequest, points);
   }
 
   /** Sends everything queued. Resolves true when it all went out within timeoutMs. */
