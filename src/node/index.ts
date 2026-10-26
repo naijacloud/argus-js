@@ -15,6 +15,8 @@ import { captureException, getClient, setClient } from '../core/api.js';
 import { Client, type Options, type Platform, Span, parseTraceparent } from '../core/client.js';
 import { setRandom } from '../core/ids.js';
 import { stripQuery } from '../core/scrub.js';
+import { packageName } from './package-name.js';
+import { VERSION } from '../version.js';
 
 export * from '../core/api.js';
 export type { ArgusEvent, Breadcrumb, CaptureContext, Client, Level, Options, User } from '../core/client.js';
@@ -37,10 +39,6 @@ function env(...names: string[]): string | undefined {
   return undefined;
 }
 
-function packageName(): string | undefined {
-  return env('npm_package_name');
-}
-
 /** Starts Argus. Options win over ARGUS_* and then SENTRY_* environment variables. */
 export function init(options: Options = {}): Client {
   const existing = getClient();
@@ -54,14 +52,16 @@ export function init(options: Options = {}): Client {
     activeSpan: () => als.getStore(),
     withSpan: (span, fn) => als.run(span, fn),
     fetch: globalThis.fetch.bind(globalThis),
+    // Cloudflare in front of ingest blocks some default user agents.
+    userAgent: `argus.javascript/${VERSION}`,
   };
   const client = new Client(
     {
       ...options,
       dsn: options.dsn ?? env('ARGUS_DSN', 'SENTRY_DSN'),
       release: options.release ?? env('ARGUS_RELEASE', 'SENTRY_RELEASE'),
-      environment: options.environment ?? env('ARGUS_ENVIRONMENT', 'SENTRY_ENVIRONMENT'),
-      serviceName: options.serviceName ?? env('ARGUS_SERVICE_NAME', 'OTEL_SERVICE_NAME') ?? packageName(),
+      environment: options.environment || env('ARGUS_ENVIRONMENT', 'SENTRY_ENVIRONMENT') || 'production',
+      serviceName: options.serviceName || env('ARGUS_SERVICE_NAME', 'OTEL_SERVICE_NAME') || packageName() || 'app',
     },
     platform,
   );

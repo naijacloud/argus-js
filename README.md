@@ -185,7 +185,8 @@ cron.checkIn('nightly-invoices', 'ok'); // or 'error', or an exit code
 ```
 
 `withMonitor` reports the start, then success or failure, and rethrows your
-job's error.
+job's error. If no monitor has that slug, Argus answers 404 and that check-in is
+dropped; other check-ins keep going.
 
 ## Feature flags
 
@@ -199,16 +200,24 @@ const theme = await flags.variant('theme', user.id, 'light');
 ```
 
 - **Caching:** answers are cached for 30 seconds per user.
-- **Fallback:** if Argus can't be reached, or the flag doesn't exist, you get
-  the fallback you passed.
+- **Fallback:** you get the fallback you passed if the flag doesn't exist, or if
+  Argus doesn't answer within 2 seconds, refuses the key, or rate-limits the
+  request. After a refused key (401 or 403) the SDK stops asking until the
+  process restarts. After a 429 it waits for `Retry-After` before asking again.
+  Until then you get the last answer it had, or your fallback.
 
 ## Privacy
 
 On by default:
 
 - The values of keys such as `password`, `token`, `secret`, `authorization`,
-  `cookie`, `bvn` and `card` are replaced with `[Filtered]`, at any depth.
-- Card numbers, bearer tokens and JWTs are filtered inside strings.
+  `cookie`, `bvn` and `card` are replaced with `[Filtered]`, at any depth. A
+  sensitive header, such as `Authorization`, `Cookie` or `X-Api-Key`, has its
+  whole value filtered.
+- Card numbers, bearer tokens and JWTs are filtered inside strings, and so are
+  sensitive pairs written as `password=…`, `password: …` or JSON
+  `"password": "…"`. Short keys such as `pin`, `otp`, `sid` and `card` count only
+  in the `pin=…` form, so a log line like `card: declined` stays readable.
 - Query strings are removed from URLs in breadcrumbs and spans.
 - The user's IP address is not sent unless you set `sendDefaultPii: true`.
 
@@ -220,8 +229,8 @@ Argus filters again on arrival.
 | -- | -- | -- |
 | `dsn` | `ARGUS_DSN`, then `SENTRY_DSN` | Without one, nothing is sent |
 | `release` | `ARGUS_RELEASE` | Your app's version, like `1.4.2` or a git commit |
-| `environment` | `ARGUS_ENVIRONMENT`, else `production` | |
-| `serviceName` | `ARGUS_SERVICE_NAME`, else the package name | Shown on logs, metrics and traces |
+| `environment` | `ARGUS_ENVIRONMENT`, then `SENTRY_ENVIRONMENT`, else `production` | |
+| `serviceName` | `ARGUS_SERVICE_NAME`, then `OTEL_SERVICE_NAME`, then the `name` in your `package.json`, else `app` | Shown on logs, metrics and traces |
 | `sampleRate` | `1` | Share of errors sent |
 | `tracesSampleRate` | `1` | Share of traces sent |
 | `sendDefaultPii` | `false` | Send the user's IP address |
@@ -233,6 +242,25 @@ Argus filters again on arrival.
 
 Call `await flush()` before a short script exits. Long-running servers don't
 need to.
+
+## Sending
+
+The SDK never blocks your app and never throws. Each kind of data (errors,
+logs, metrics, traces, crons) has its own queue of at most 100 requests and
+1 MB. When a queue is full, the oldest waiting request is dropped. Logs, metrics
+and traces are split so that no request is larger than 512 KB.
+
+- **Network errors and 5xx:** the SDK retries after 1 s, 2 s, 4 s and so on,
+  up to 5 tries.
+- **429:** the SDK sends nothing more to that endpoint until `Retry-After` has
+  passed (or the `X-Sentry-Rate-Limits` time). Then it resends the request it
+  was holding. The wait doesn't count as a try. New data keeps queuing in the
+  meantime.
+- **401 or 403:** the key was refused. The SDK stops sending to that endpoint
+  until the process restarts.
+- **Any other 4xx:** that request is dropped.
+
+On Node, every request carries `User-Agent: argus.javascript/<version>`.
 
 ## Check it works
 

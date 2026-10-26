@@ -21,8 +21,22 @@ export function sensitiveKey(key: string): boolean {
 const CARD = /\b(?:\d[ -]?){12,18}\d\b/g;
 const BEARER = /\b(bearer|basic|token)\s+[A-Za-z0-9._~+/=-]{8,}/gi;
 const JWT = /\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b/g;
-const KV =
-  /\b([a-z0-9_-]*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential|bvn|cvv)[a-z0-9_-]*)(\s*[:=]\s*)(["']?)([^"'\s,;&})]+)/gi;
+// The value of a sensitive pair, unless it is already filtered or is a
+// `Bearer …` credential (the pattern above has filtered its secret part).
+const VALUE = String.raw`(?!\[Filtered\])(?!(?:bearer|basic|token)\s)([^"'\s,;&})<>\[\]]+)`;
+// `key=value`, `key: value` and JSON `"key": "value"` where the key contains a
+// word from the spec's contains list, spelled to allow `_`/`-` inside it.
+const KV = new RegExp(
+  String.raw`\b([a-z0-9_-]*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|authorization` +
+    String.raw`|credential|cookie|private[_-]?key|card[_-]?number|credit[_-]?card|bvn|cvv|cvc` +
+    String.raw`|session[_-]?id|session[_-]?token|signature)[a-z0-9_-]*)(["']?\s*[:=]\s*)(["']?)` +
+    VALUE,
+  'gi',
+);
+// The spec's exact keys. Only `=` counts: "pin: 1234" is rare, while
+// "session: started" or "card: declined" in a log line are not secrets.
+// (A capture, not a lookbehind, so older Safari can still parse it.)
+const KV_EXACT = new RegExp(String.raw`(^|[^A-Za-z0-9_-])(auth|pwd|pin|otp|session|card|sid)(["']?\s*=\s*)(["']?)` + VALUE, 'gi');
 
 function luhn(digits: string): boolean {
   let sum = 0;
@@ -39,7 +53,7 @@ function luhn(digits: string): boolean {
   return sum % 10 === 0;
 }
 
-/** Filters card numbers, credentials, JWTs and sensitive key=value pairs inside a string. */
+/** Filters card numbers, credentials, JWTs and sensitive `key=value` / `key: value` / JSON pairs inside a string. */
 export function scrubString(s: string): string {
   if (!s) return s;
   return s
@@ -49,7 +63,8 @@ export function scrubString(s: string): string {
     })
     .replace(BEARER, (_m, scheme: string) => `${scheme} ${FILTERED}`)
     .replace(JWT, FILTERED)
-    .replace(KV, (_m, k: string, sep: string, q: string) => `${k}${sep}${q}${FILTERED}`);
+    .replace(KV, (_m, k: string, sep: string, q: string) => `${k}${sep}${q}${FILTERED}`)
+    .replace(KV_EXACT, (_m, pre: string, k: string, sep: string, q: string) => `${pre}${k}${sep}${q}${FILTERED}`);
 }
 
 /** Deep-scrubs a JSON-like value. Cycles and depth beyond 8 are cut. */
