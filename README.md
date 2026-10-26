@@ -106,9 +106,8 @@ init({ dsn: process.env.NEXT_PUBLIC_ARGUS_DSN });
 
 The server file covers route handlers, server actions and rendering errors
 (`onRequestError`, Next.js 15+). The client file covers the browser. The same
-import resolves to the right build in each. In the Edge runtime only what you
-send yourself (`captureException`, `log`) is reported; nothing is hooked
-automatically there.
+import resolves to the right build in each. Argus doesn't run in the Edge
+runtime yet: nothing is reported from Edge routes or middleware.
 
 ## Browser
 
